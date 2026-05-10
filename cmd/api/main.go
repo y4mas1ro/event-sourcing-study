@@ -34,22 +34,20 @@ func main() {
 	store := eventstore.New()
 	model := projection.NewAccountReadModel()
 
-	// このプロセス内でもプロジェクションを購読する（単一プロセス構成）
-	subscribeProjection(nc, model)
-
 	cmdHandler := command.NewHandler(store, nc)
 	qryHandler := query.NewHandler(model)
 
-	mux := http.NewServeMux()
+	// プロジェクション: イベントを受けて読み取りモデルを更新する
+	subscribeProjection(nc, model)
 
-	// --- コマンド側 (書き込み) ---
+	// Transfer Saga: TransferredOut を受けて受取口座への TransferredIn を非同期実行する
+	subscribeTransferSaga(nc, cmdHandler)
+
+	mux := http.NewServeMux()
 	mux.HandleFunc("POST /accounts", handleOpenAccount(cmdHandler))
 	mux.HandleFunc("POST /accounts/{id}/deposits", handleDeposit(cmdHandler))
 	mux.HandleFunc("POST /accounts/{id}/withdrawals", handleWithdraw(cmdHandler))
-
 	mux.HandleFunc("POST /accounts/{id}/transfers", handleTransfer(cmdHandler))
-
-	// --- クエリ側 (読み取り) ---
 	mux.HandleFunc("GET /accounts/{id}", handleGetAccount(qryHandler))
 
 	addr := ":8080"
@@ -70,6 +68,32 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 	log.Println("API server stopped")
+}
+
+// subscribeTransferSaga は TransferredOut イベントを購読し、
+// 受取口座への TransferredIn を非同期で処理する（送金元と受取口座を別コンテキストで扱う）
+func subscribeTransferSaga(nc *nats.Conn, h *command.Handler) {
+	subject := "account." + string(account.EventMoneyTransferredOut)
+	_, _ = nc.Subscribe(subject, func(msg *nats.Msg) {
+		var e struct {
+			AggregateID string                       `json:"aggregate_id"`
+			Data        account.MoneyTransferredOutData `json:"data"`
+		}
+		if err := json.Unmarshal(msg.Data, &e); err != nil {
+			log.Printf("[saga] unmarshal error: %v", err)
+			return
+		}
+		cmd := account.TransferMoney{
+			FromAccountID: e.AggregateID,
+			ToAccountID:   e.Data.ToAccountID,
+			Amount:        e.Data.Amount,
+		}
+		log.Printf("[saga] TransferredOut received: %s -> %s (%d), processing TransferIn...",
+			cmd.FromAccountID, cmd.ToAccountID, cmd.Amount)
+		if err := h.HandleTransferIn(context.Background(), cmd); err != nil {
+			log.Printf("[saga] HandleTransferIn error: %v", err)
+		}
+	})
 }
 
 func subscribeProjection(nc *nats.Conn, model *projection.AccountReadModel) {
@@ -203,6 +227,8 @@ func handleWithdraw(h *command.Handler) http.HandlerFunc {
 	}
 }
 
+// handleTransfer は送金元の出金のみ処理し即座に返す。
+// 受取口座への入金は subscribeTransferSaga が非同期で処理する。
 func handleTransfer(h *command.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -218,7 +244,7 @@ func handleTransfer(h *command.Handler) http.HandlerFunc {
 			ToAccountID:   body.ToAccountID,
 			Amount:        body.Amount,
 		}
-		if err := h.HandleTransferMoney(r.Context(), cmd); err != nil {
+		if err := h.HandleTransferOut(r.Context(), cmd); err != nil {
 			code := http.StatusUnprocessableEntity
 			if errors.Is(err, account.ErrInsufficientFunds) {
 				code = http.StatusConflict
@@ -226,8 +252,8 @@ func handleTransfer(h *command.Handler) http.HandlerFunc {
 			writeError(w, code, err.Error())
 			return
 		}
-		log.Printf("[cmd] TransferMoney: %s -> %s (%d)", cmd.FromAccountID, cmd.ToAccountID, cmd.Amount)
-		w.WriteHeader(http.StatusNoContent)
+		log.Printf("[cmd] TransferOut: %s -> %s (%d)", cmd.FromAccountID, cmd.ToAccountID, cmd.Amount)
+		w.WriteHeader(http.StatusAccepted) // 202: 出金確定、入金は非同期
 	}
 }
 

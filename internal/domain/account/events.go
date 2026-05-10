@@ -35,11 +35,11 @@ type MoneyWithdrawnData struct {
 }
 
 type MoneyTransferredOutData struct {
-	Amount          int64
-	ToAccountID     string
+	Amount      int64  `json:"Amount"`
+	ToAccountID string `json:"ToAccountID"`
 }
 
 type MoneyTransferredInData struct {
-	Amount          int64
-	FromAccountID   string
+	Amount        int64  `json:"Amount"`
+	FromAccountID string `json:"FromAccountID"`
 }

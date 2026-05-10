@@ -50,10 +50,9 @@ func (h *Handler) HandleWithdrawMoney(ctx context.Context, cmd account.WithdrawM
 	return h.saveAndPublish(ctx, cmd.AccountID, a, version)
 }
 
-// HandleTransferMoney は振り込みコマンドを処理する。
-// 送金元に TransferredOut、受取口座に TransferredIn イベントをそれぞれ生成・発行する。
-func (h *Handler) HandleTransferMoney(ctx context.Context, cmd account.TransferMoney) error {
-	// 送金元を処理
+// HandleTransferOut は送金元の出金のみを処理する。
+// 受取口座への入金は TransferredOut イベントを受けた subscriber が非同期で行う。
+func (h *Handler) HandleTransferOut(ctx context.Context, cmd account.TransferMoney) error {
 	from, fromVersion, err := h.load(ctx, cmd.FromAccountID)
 	if err != nil {
 		return err
@@ -61,21 +60,17 @@ func (h *Handler) HandleTransferMoney(ctx context.Context, cmd account.TransferM
 	if err := from.TransferOut(cmd); err != nil {
 		return err
 	}
-	if err := h.saveAndPublish(ctx, cmd.FromAccountID, from, fromVersion); err != nil {
-		return fmt.Errorf("transfer out: %w", err)
-	}
+	return h.saveAndPublish(ctx, cmd.FromAccountID, from, fromVersion)
+}
 
-	// 受取口座を処理（送金元の保存成功後に実行）
+// HandleTransferIn は受取口座への入金を処理する。subscriber から非同期で呼ばれる。
+func (h *Handler) HandleTransferIn(ctx context.Context, cmd account.TransferMoney) error {
 	to, toVersion, err := h.load(ctx, cmd.ToAccountID)
 	if err != nil {
 		return err
 	}
 	to.TransferIn(cmd)
-	if err := h.saveAndPublish(ctx, cmd.ToAccountID, to, toVersion); err != nil {
-		return fmt.Errorf("transfer in: %w", err)
-	}
-
-	return nil
+	return h.saveAndPublish(ctx, cmd.ToAccountID, to, toVersion)
 }
 
 // load はイベント履歴から集約を再構築する（Event Sourcing の核心）
