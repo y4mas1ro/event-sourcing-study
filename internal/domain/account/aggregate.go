@@ -89,6 +89,35 @@ func (a *Account) Withdraw(cmd WithdrawMoney) error {
 	return nil
 }
 
+// TransferOut は送金元口座に振り込み出金イベントを生成する
+func (a *Account) TransferOut(cmd TransferMoney) error {
+	if cmd.Amount <= 0 {
+		return ErrNegativeAmount
+	}
+	if a.balance < cmd.Amount {
+		return ErrInsufficientFunds
+	}
+	a.apply(Event{
+		AggregateID: a.id,
+		Type:        EventMoneyTransferredOut,
+		Data:        MoneyTransferredOutData{Amount: cmd.Amount, ToAccountID: cmd.ToAccountID},
+		OccurredAt:  time.Now(),
+		Version:     a.version + 1,
+	}, true)
+	return nil
+}
+
+// TransferIn は受取口座に振り込み入金イベントを生成する
+func (a *Account) TransferIn(cmd TransferMoney) {
+	a.apply(Event{
+		AggregateID: a.id,
+		Type:        EventMoneyTransferredIn,
+		Data:        MoneyTransferredInData{Amount: cmd.Amount, FromAccountID: cmd.FromAccountID},
+		OccurredAt:  time.Now(),
+		Version:     a.version + 1,
+	}, true)
+}
+
 // Reconstitute はイベント履歴から集約を再構築する（Event Sourcing の核心）
 func (a *Account) Reconstitute(events []Event) {
 	for _, e := range events {
@@ -110,6 +139,12 @@ func (a *Account) apply(e Event, new bool) {
 	case EventMoneyWithdrawn:
 		d := e.Data.(MoneyWithdrawnData)
 		a.balance -= d.Amount
+	case EventMoneyTransferredOut:
+		d := e.Data.(MoneyTransferredOutData)
+		a.balance -= d.Amount
+	case EventMoneyTransferredIn:
+		d := e.Data.(MoneyTransferredInData)
+		a.balance += d.Amount
 	}
 	a.version = e.Version
 	if new {

@@ -50,6 +50,34 @@ func (h *Handler) HandleWithdrawMoney(ctx context.Context, cmd account.WithdrawM
 	return h.saveAndPublish(ctx, cmd.AccountID, a, version)
 }
 
+// HandleTransferMoney は振り込みコマンドを処理する。
+// 送金元に TransferredOut、受取口座に TransferredIn イベントをそれぞれ生成・発行する。
+func (h *Handler) HandleTransferMoney(ctx context.Context, cmd account.TransferMoney) error {
+	// 送金元を処理
+	from, fromVersion, err := h.load(ctx, cmd.FromAccountID)
+	if err != nil {
+		return err
+	}
+	if err := from.TransferOut(cmd); err != nil {
+		return err
+	}
+	if err := h.saveAndPublish(ctx, cmd.FromAccountID, from, fromVersion); err != nil {
+		return fmt.Errorf("transfer out: %w", err)
+	}
+
+	// 受取口座を処理（送金元の保存成功後に実行）
+	to, toVersion, err := h.load(ctx, cmd.ToAccountID)
+	if err != nil {
+		return err
+	}
+	to.TransferIn(cmd)
+	if err := h.saveAndPublish(ctx, cmd.ToAccountID, to, toVersion); err != nil {
+		return fmt.Errorf("transfer in: %w", err)
+	}
+
+	return nil
+}
+
 // load はイベント履歴から集約を再構築する（Event Sourcing の核心）
 func (h *Handler) load(ctx context.Context, id string) (*account.Account, int, error) {
 	events, err := h.store.Load(ctx, id)

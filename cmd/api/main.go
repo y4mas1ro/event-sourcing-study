@@ -47,6 +47,8 @@ func main() {
 	mux.HandleFunc("POST /accounts/{id}/deposits", handleDeposit(cmdHandler))
 	mux.HandleFunc("POST /accounts/{id}/withdrawals", handleWithdraw(cmdHandler))
 
+	mux.HandleFunc("POST /accounts/{id}/transfers", handleTransfer(cmdHandler))
+
 	// --- クエリ側 (読み取り) ---
 	mux.HandleFunc("GET /accounts/{id}", handleGetAccount(qryHandler))
 
@@ -105,6 +107,22 @@ func subscribeProjection(nc *nats.Conn, model *projection.AccountReadModel) {
 			}
 			model.Apply(e.AggregateID, func(v *projection.AccountView) {
 				v.Balance -= d.Amount
+			})
+		case account.EventMoneyTransferredOut:
+			var d account.MoneyTransferredOutData
+			if err := json.Unmarshal(e.Data, &d); err != nil {
+				return
+			}
+			model.Apply(e.AggregateID, func(v *projection.AccountView) {
+				v.Balance -= d.Amount
+			})
+		case account.EventMoneyTransferredIn:
+			var d account.MoneyTransferredInData
+			if err := json.Unmarshal(e.Data, &d); err != nil {
+				return
+			}
+			model.Apply(e.AggregateID, func(v *projection.AccountView) {
+				v.Balance += d.Amount
 			})
 		}
 	})
@@ -181,6 +199,34 @@ func handleWithdraw(h *command.Handler) http.HandlerFunc {
 			return
 		}
 		log.Printf("[cmd] WithdrawMoney: %s (-%d)", cmd.AccountID, cmd.Amount)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func handleTransfer(h *command.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ToAccountID string `json:"to_account_id"`
+			Amount      int64  `json:"amount"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		cmd := account.TransferMoney{
+			FromAccountID: r.PathValue("id"),
+			ToAccountID:   body.ToAccountID,
+			Amount:        body.Amount,
+		}
+		if err := h.HandleTransferMoney(r.Context(), cmd); err != nil {
+			code := http.StatusUnprocessableEntity
+			if errors.Is(err, account.ErrInsufficientFunds) {
+				code = http.StatusConflict
+			}
+			writeError(w, code, err.Error())
+			return
+		}
+		log.Printf("[cmd] TransferMoney: %s -> %s (%d)", cmd.FromAccountID, cmd.ToAccountID, cmd.Amount)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

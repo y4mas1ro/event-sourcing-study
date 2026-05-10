@@ -18,3 +18,10 @@ type WithdrawMoney struct {
 	AccountID string
 	Amount    int64
 }
+
+// TransferMoney は別口座への振り込みコマンド
+type TransferMoney struct {
+	FromAccountID string
+	ToAccountID   string
+	Amount        int64
+}
