@@ -12,11 +12,11 @@ import (
 
 // Handler はコマンドを受け取り、集約を操作し、イベントを保存・発行する（書き込み側）
 type Handler struct {
-	store *eventstore.Store
+	store eventstore.EventStore
 	nc    *nats.Conn
 }
 
-func NewHandler(store *eventstore.Store, nc *nats.Conn) *Handler {
+func NewHandler(store eventstore.EventStore, nc *nats.Conn) *Handler {
 	return &Handler{store: store, nc: nc}
 }
 
@@ -73,7 +73,6 @@ func (h *Handler) HandleTransferIn(ctx context.Context, cmd account.TransferMone
 	return h.saveAndPublish(ctx, cmd.ToAccountID, to, toVersion)
 }
 
-// load はイベント履歴から集約を再構築する（Event Sourcing の核心）
 func (h *Handler) load(ctx context.Context, id string) (*account.Account, int, error) {
 	events, err := h.store.Load(ctx, id)
 	if err != nil {
@@ -84,7 +83,6 @@ func (h *Handler) load(ctx context.Context, id string) (*account.Account, int, e
 	return a, len(events), nil
 }
 
-// saveAndPublish はイベントを保存し NATS に発行する
 func (h *Handler) saveAndPublish(ctx context.Context, id string, a *account.Account, expectedVersion int) error {
 	changes := a.Changes()
 	if err := h.store.Save(ctx, id, changes, expectedVersion); err != nil {

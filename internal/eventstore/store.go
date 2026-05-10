@@ -10,34 +10,35 @@ import (
 
 var ErrConcurrencyConflict = errors.New("concurrency conflict: version mismatch")
 
-// Store はイベントをインメモリに保存するイベントストア
-// 本番では PostgreSQL や EventStoreDB を使用する
-type Store struct {
+// EventStore はイベントの保存と読み込みを抽象化するインターフェース
+type EventStore interface {
+	Save(ctx context.Context, aggregateID string, events []account.Event, expectedVersion int) error
+	Load(ctx context.Context, aggregateID string) ([]account.Event, error)
+}
+
+// MemoryStore はインメモリのイベントストア実装（開発・テスト用）
+type MemoryStore struct {
 	mu     sync.RWMutex
-	events map[string][]account.Event // aggregateID -> events
+	events map[string][]account.Event
 }
 
-func New() *Store {
-	return &Store{events: make(map[string][]account.Event)}
+func New() *MemoryStore {
+	return &MemoryStore{events: make(map[string][]account.Event)}
 }
 
-// Save はイベントをストアに保存する。楽観的ロックでバージョン競合を検出する
-func (s *Store) Save(_ context.Context, aggregateID string, events []account.Event, expectedVersion int) error {
+func (s *MemoryStore) Save(_ context.Context, aggregateID string, events []account.Event, expectedVersion int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	existing := s.events[aggregateID]
-	currentVersion := len(existing)
-	if currentVersion != expectedVersion {
+	if len(existing) != expectedVersion {
 		return ErrConcurrencyConflict
 	}
-
 	s.events[aggregateID] = append(existing, events...)
 	return nil
 }
 
-// Load は指定した集約のイベント履歴をすべて返す
-func (s *Store) Load(_ context.Context, aggregateID string) ([]account.Event, error) {
+func (s *MemoryStore) Load(_ context.Context, aggregateID string) ([]account.Event, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

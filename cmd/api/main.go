@@ -15,11 +15,14 @@ import (
 	"github.com/y4mas1ro/event-sourcing-study/internal/command"
 	"github.com/y4mas1ro/event-sourcing-study/internal/domain/account"
 	"github.com/y4mas1ro/event-sourcing-study/internal/eventstore"
+	pgstore "github.com/y4mas1ro/event-sourcing-study/internal/eventstore/postgres"
 	"github.com/y4mas1ro/event-sourcing-study/internal/projection"
 	"github.com/y4mas1ro/event-sourcing-study/internal/query"
 )
 
 func main() {
+	ctx := context.Background()
+
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
 		natsURL = nats.DefaultURL
@@ -31,17 +34,14 @@ func main() {
 	}
 	defer nc.Close()
 
-	store := eventstore.New()
-	model := projection.NewAccountReadModel()
+	store, closeStore := newEventStore(ctx)
+	defer closeStore()
 
+	model := projection.NewAccountReadModel()
 	cmdHandler := command.NewHandler(store, nc)
 	qryHandler := query.NewHandler(model)
 
-	// プロジェクション: イベントを受けて読み取りモデルを更新する
 	subscribeProjection(nc, model)
-
-	// Transfer Saga: TransferredOut を受けて受取口座への TransferredIn を非同期実行する
-	subscribeTransferSaga(nc, cmdHandler)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /accounts", handleOpenAccount(cmdHandler))
@@ -64,36 +64,25 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
+	_ = srv.Shutdown(shutCtx)
 	log.Println("API server stopped")
 }
 
-// subscribeTransferSaga は TransferredOut イベントを購読し、
-// 受取口座への TransferredIn を非同期で処理する（送金元と受取口座を別コンテキストで扱う）
-func subscribeTransferSaga(nc *nats.Conn, h *command.Handler) {
-	subject := "account." + string(account.EventMoneyTransferredOut)
-	_, _ = nc.Subscribe(subject, func(msg *nats.Msg) {
-		var e struct {
-			AggregateID string                       `json:"aggregate_id"`
-			Data        account.MoneyTransferredOutData `json:"data"`
-		}
-		if err := json.Unmarshal(msg.Data, &e); err != nil {
-			log.Printf("[saga] unmarshal error: %v", err)
-			return
-		}
-		cmd := account.TransferMoney{
-			FromAccountID: e.AggregateID,
-			ToAccountID:   e.Data.ToAccountID,
-			Amount:        e.Data.Amount,
-		}
-		log.Printf("[saga] TransferredOut received: %s -> %s (%d), processing TransferIn...",
-			cmd.FromAccountID, cmd.ToAccountID, cmd.Amount)
-		if err := h.HandleTransferIn(context.Background(), cmd); err != nil {
-			log.Printf("[saga] HandleTransferIn error: %v", err)
-		}
-	})
+// newEventStore は DATABASE_URL が設定されていれば PostgreSQL、なければインメモリを返す
+func newEventStore(ctx context.Context) (eventstore.EventStore, func()) {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Println("[store] using in-memory event store")
+		return eventstore.New(), func() {}
+	}
+	store, err := pgstore.New(ctx, dsn)
+	if err != nil {
+		log.Fatalf("postgres event store: %v", err)
+	}
+	log.Println("[store] using PostgreSQL event store")
+	return store, store.Close
 }
 
 func subscribeProjection(nc *nats.Conn, model *projection.AccountReadModel) {
@@ -228,7 +217,7 @@ func handleWithdraw(h *command.Handler) http.HandlerFunc {
 }
 
 // handleTransfer は送金元の出金のみ処理し即座に返す。
-// 受取口座への入金は subscribeTransferSaga が非同期で処理する。
+// 受取口座への入金は cmd/subscriber の Saga が非同期で処理する。
 func handleTransfer(h *command.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
