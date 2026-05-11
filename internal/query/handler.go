@@ -10,10 +10,10 @@ var ErrNotFound = errors.New("account not found")
 
 // Handler はクエリを処理し読み取りモデルからデータを返す（読み取り側）
 type Handler struct {
-	model *projection.AccountReadModel
+	model projection.ViewReader
 }
 
-func NewHandler(model *projection.AccountReadModel) *Handler {
+func NewHandler(model projection.ViewReader) *Handler {
 	return &Handler{model: model}
 }
 

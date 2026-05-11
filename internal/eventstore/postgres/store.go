@@ -31,7 +31,11 @@ func (s *Store) Close() {
 	s.pool.Close()
 }
 
-// Save はトランザクション内で楽観的ロックを使ってイベントを保存する
+// Pool は内部の pgxpool.Pool を返す（Outbox リレーや Saga 状態管理で使用）
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+
+// Save はトランザクション内で楽観的ロックを使ってイベントを保存する。
+// published=false で保存し、Outbox リレーが NATS へ発行する。
 func (s *Store) Save(ctx context.Context, aggregateID string, events []account.Event, expectedVersion int) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -56,8 +60,8 @@ func (s *Store) Save(ctx context.Context, aggregateID string, events []account.E
 			return err
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO events (aggregate_id, event_type, data, occurred_at, version)
-			 VALUES ($1, $2, $3, $4, $5)`,
+			`INSERT INTO events (aggregate_id, event_type, data, occurred_at, version, published)
+			 VALUES ($1, $2, $3, $4, $5, false)`,
 			aggregateID, string(e.Type), data, e.OccurredAt, e.Version,
 		); err != nil {
 			return err

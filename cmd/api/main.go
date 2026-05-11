@@ -16,32 +16,27 @@ import (
 	"github.com/y4mas1ro/event-sourcing-study/internal/domain/account"
 	"github.com/y4mas1ro/event-sourcing-study/internal/eventstore"
 	pgstore "github.com/y4mas1ro/event-sourcing-study/internal/eventstore/postgres"
+	"github.com/y4mas1ro/event-sourcing-study/internal/outbox"
 	"github.com/y4mas1ro/event-sourcing-study/internal/projection"
 	"github.com/y4mas1ro/event-sourcing-study/internal/query"
 )
 
 func main() {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
 		natsURL = nats.DefaultURL
 	}
-
 	nc, err := nats.Connect(natsURL)
 	if err != nil {
 		log.Fatalf("NATS connect: %v", err)
 	}
 	defer nc.Close()
 
-	store, closeStore := newEventStore(ctx)
-	defer closeStore()
-
-	model := projection.NewAccountReadModel()
-	cmdHandler := command.NewHandler(store, nc)
-	qryHandler := query.NewHandler(model)
-
-	subscribeProjection(nc, model)
+	cmdHandler, qryHandler, cleanup := buildHandlers(ctx, nc)
+	defer cleanup()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /accounts", handleOpenAccount(cmdHandler))
@@ -52,7 +47,6 @@ func main() {
 
 	addr := ":8080"
 	srv := &http.Server{Addr: addr, Handler: mux}
-
 	go func() {
 		log.Printf("API server listening on %s", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -63,29 +57,49 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+	cancel()
 
-	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutCancel()
 	_ = srv.Shutdown(shutCtx)
 	log.Println("API server stopped")
 }
 
-// newEventStore は DATABASE_URL が設定されていれば PostgreSQL、なければインメモリを返す
-func newEventStore(ctx context.Context) (eventstore.EventStore, func()) {
+// buildHandlers は DATABASE_URL の有無で動作モードを切り替える。
+//
+//   - PostgreSQL モード: イベントを published=false で保存し、Outbox リレーが NATS に発行。
+//     クエリは account_views テーブルを読む。
+//   - インメモリモード: 従来どおり保存後すぐ NATS に発行し、インメモリ読み取りモデルを使う。
+func buildHandlers(ctx context.Context, nc *nats.Conn) (*command.Handler, *query.Handler, func()) {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Println("[store] using in-memory event store")
-		return eventstore.New(), func() {}
+		log.Println("[store] using in-memory event store (memory mode)")
+		memStore := eventstore.New()
+		model := projection.NewAccountReadModel()
+		subscribeProjectionInMemory(nc, model)
+		return command.NewHandler(memStore),
+			query.NewHandler(model),
+			func() {}
 	}
-	store, err := pgstore.New(ctx, dsn)
+
+	log.Println("[store] using PostgreSQL event store (postgres mode)")
+	pg, err := pgstore.New(ctx, dsn)
 	if err != nil {
 		log.Fatalf("postgres event store: %v", err)
 	}
-	log.Println("[store] using PostgreSQL event store")
-	return store, store.Close
+
+	// Outbox リレー: published=false のイベントを NATS に発行する
+	relay := outbox.NewRelay(pg.Pool(), nc)
+	go relay.Run(ctx)
+
+	viewStore := projection.NewPostgresViewStore(pg.Pool())
+	return command.NewHandler(pg),
+		query.NewHandler(viewStore),
+		pg.Close
 }
 
-func subscribeProjection(nc *nats.Conn, model *projection.AccountReadModel) {
+// subscribeProjectionInMemory はインメモリモード専用のプロジェクション購読
+func subscribeProjectionInMemory(nc *nats.Conn, model *projection.AccountReadModel) {
 	_, _ = nc.Subscribe("account.*", func(msg *nats.Msg) {
 		var e struct {
 			AggregateID string          `json:"aggregate_id"`
@@ -110,38 +124,30 @@ func subscribeProjection(nc *nats.Conn, model *projection.AccountReadModel) {
 			if err := json.Unmarshal(e.Data, &d); err != nil {
 				return
 			}
-			model.Apply(e.AggregateID, func(v *projection.AccountView) {
-				v.Balance += d.Amount
-			})
+			model.Apply(e.AggregateID, func(v *projection.AccountView) { v.Balance += d.Amount })
 		case account.EventMoneyWithdrawn:
 			var d account.MoneyWithdrawnData
 			if err := json.Unmarshal(e.Data, &d); err != nil {
 				return
 			}
-			model.Apply(e.AggregateID, func(v *projection.AccountView) {
-				v.Balance -= d.Amount
-			})
+			model.Apply(e.AggregateID, func(v *projection.AccountView) { v.Balance -= d.Amount })
 		case account.EventMoneyTransferredOut:
 			var d account.MoneyTransferredOutData
 			if err := json.Unmarshal(e.Data, &d); err != nil {
 				return
 			}
-			model.Apply(e.AggregateID, func(v *projection.AccountView) {
-				v.Balance -= d.Amount
-			})
+			model.Apply(e.AggregateID, func(v *projection.AccountView) { v.Balance -= d.Amount })
 		case account.EventMoneyTransferredIn:
 			var d account.MoneyTransferredInData
 			if err := json.Unmarshal(e.Data, &d); err != nil {
 				return
 			}
-			model.Apply(e.AggregateID, func(v *projection.AccountView) {
-				v.Balance += d.Amount
-			})
+			model.Apply(e.AggregateID, func(v *projection.AccountView) { v.Balance += d.Amount })
 		}
 	})
 }
 
-// --- ハンドラー ---
+// --- HTTP ハンドラー ---
 
 func handleOpenAccount(h *command.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -177,10 +183,7 @@ func handleDeposit(h *command.Handler) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		cmd := account.DepositMoney{
-			AccountID: r.PathValue("id"),
-			Amount:    body.Amount,
-		}
+		cmd := account.DepositMoney{AccountID: r.PathValue("id"), Amount: body.Amount}
 		if err := h.HandleDepositMoney(r.Context(), cmd); err != nil {
 			writeError(w, http.StatusUnprocessableEntity, err.Error())
 			return
@@ -199,10 +202,7 @@ func handleWithdraw(h *command.Handler) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		cmd := account.WithdrawMoney{
-			AccountID: r.PathValue("id"),
-			Amount:    body.Amount,
-		}
+		cmd := account.WithdrawMoney{AccountID: r.PathValue("id"), Amount: body.Amount}
 		if err := h.HandleWithdrawMoney(r.Context(), cmd); err != nil {
 			code := http.StatusUnprocessableEntity
 			if errors.Is(err, account.ErrInsufficientFunds) {
@@ -216,7 +216,7 @@ func handleWithdraw(h *command.Handler) http.HandlerFunc {
 	}
 }
 
-// handleTransfer は送金元の出金のみ処理し即座に返す。
+// handleTransfer は送金元の出金のみ処理し即座に返す（202 Accepted）。
 // 受取口座への入金は cmd/subscriber の Saga が非同期で処理する。
 func handleTransfer(h *command.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -242,7 +242,7 @@ func handleTransfer(h *command.Handler) http.HandlerFunc {
 			return
 		}
 		log.Printf("[cmd] TransferOut: %s -> %s (%d)", cmd.FromAccountID, cmd.ToAccountID, cmd.Amount)
-		w.WriteHeader(http.StatusAccepted) // 202: 出金確定、入金は非同期
+		w.WriteHeader(http.StatusAccepted)
 	}
 }
 

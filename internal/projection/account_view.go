@@ -19,6 +19,9 @@ type AccountReadModel struct {
 	data map[string]*AccountView
 }
 
+// AccountReadModel は ViewReader インターフェースを実装する（インメモリ）
+var _ ViewReader = (*AccountReadModel)(nil)
+
 func NewAccountReadModel() *AccountReadModel {
 	return &AccountReadModel{data: make(map[string]*AccountView)}
 }
